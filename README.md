@@ -1,28 +1,29 @@
 # plex-windows-scaling-fix
 
-Plex for Windows locks its UI scale to whichever monitor it opens on. Open it on a 100% monitor, drag it to a 200% one, and the UI only fills a quarter of the window.
+Plex for Windows sets its UI scale once, at startup, from whichever monitor your mouse pointer is on. Start it with the pointer on a 100% monitor, move it to a 200% one, and the UI only fills a quarter of the window.
 
-This is a small launcher that always opens Plex on your highest-scaled monitor, which avoids the bug entirely.
+This is a small launcher that puts the pointer on your highest-scaled monitor for the second it takes Plex to start, so the UI looks right everywhere.
 
 ## The bug
 
-The window itself handles monitor changes fine. `Plex.exe` declares per-monitor DPI awareness (`PerMonitorV2`) and the frame resizes correctly. The UI inside it is a QtWebEngine 5.15.3 view, and its device scale factor is read once, when the view is created.
+Plex's UI is a QtWebEngine 5.15.3 view (Chromium) inside Plex's own native window. At startup, Qt creates Plex's windows on the monitor under the mouse pointer ([`effectiveScreen()` in `qplatformwindow.cpp`](https://github.com/qt/qtbase/blob/v5.15.3-lts-lgpl/src/gui/kernel/qplatformwindow.cpp#L631-L651)), and Plex then moves them into its own window. QtWebEngine takes its scale from that first monitor and never updates it.
 
-With Plex's web inspector on, open Plex on a 100% monitor and move it to a 200% one. `window.devicePixelRatio` still says `1`. Plex renders a 1x frame and draws it at 2x density, so the UI ends up in one corner. Resizing, minimizing, moving, and reloading the page all leave it at `1`. Only restarting Plex on the other monitor fixes it.
+With Plex's web inspector on, you can see it directly. Start Plex with the pointer on a 100% monitor and `window.devicePixelRatio` is `1`, even when Plex opens fullscreen on a 200% monitor. Resizing, minimizing, moving, and reloading the page leave it at `1`. Start Plex with the pointer on the 200% monitor and it's `2`, and the UI stays correct when you move the window to a 100% monitor.
 
-Going the other way is fine. A UI created at 2x and moved to a 1x monitor is just rendered at a higher resolution than it needs.
+Where Plex opens doesn't matter, only where the pointer is.
 
 ## What the launcher does
 
-Every time you open Plex through it, `PlexLauncher.exe`:
+When you open Plex through `PlexLauncher.exe`, it:
 
 1. finds the connected monitor with the highest scaling (ties go to the primary, then the larger one);
-2. points Plex's saved screen at it (`screen=` under `[ui]` in `%LOCALAPPDATA%\Plex\plex.ini`);
-3. starts Plex, which opens there at the right scale. Dragging it to a lower-scaled monitor afterwards looks fine.
+2. moves the pointer to the middle of that monitor, if it's somewhere else;
+3. starts Plex and waits until Plex has created its main UI window, usually about a second;
+4. moves the pointer back, unless you've moved it in the meantime.
 
-If Plex is already running, it brings the existing window to the front instead.
+If the pointer is already on that monitor, it just starts Plex. If Plex is already running, it brings the existing window to the front instead. It never changes Plex's settings or files.
 
-Only that one line of `plex.ini` changes. The previous file is kept as `plex.ini.launcher-bak`, and Plex's install is never touched. If anything goes wrong, Plex still starts.
+You get the same result without the launcher by opening Plex with the pointer on your highest-scaled monitor.
 
 ## Compatibility
 
@@ -47,8 +48,6 @@ To uninstall, run `.\PlexLauncher.exe --uninstall` and delete the folder.
 | `--install` | Add **Plex (Scaling Fix)** to the Start menu |
 | `--uninstall` | Remove it |
 | `--plex <path>` | Use this `Plex.exe`. By default it looks in Program Files, then at Plex's uninstall entry. |
-| `--ini <path>` | Edit this `plex.ini` instead of Plex's own |
-| `--no-launch` | Only update `plex.ini`, don't start Plex |
 
 Each run writes what it did to `PlexLauncher.log` next to the exe.
 
@@ -56,13 +55,15 @@ Each run writes what it did to `PlexLauncher.log` next to the exe.
 
 The proper fix is inside Plex: tell QtWebEngine about the new scale when the window changes screens. Plex is closed source, and nothing reachable from outside the process makes the view re-read its scale. Fixing it in-process would mean injecting a native Qt plugin built against Plex's exact Qt, and that breaks with every Plex update.
 
-Controlling where Plex opens sidesteps all of that, survives updates, and is one C# file.
+The pointer position is the only thing outside Plex that decides the scale, so the launcher sets that. It survives Plex updates and is one C# file.
 
 ## Notes
 
+**The pointer jumps for about a second** when you open Plex from another monitor. If you move the mouse during that second, the launcher leaves the pointer where you put it, but Plex may pick up the wrong scale.
+
 **It only helps when you open Plex through the launcher.** The original Plex shortcut, and Plex restarting itself after an update, skip it.
 
-**It always opens on the highest-scaled monitor.** Drag Plex wherever you want it afterwards.
+**Monitors on different GPUs.** On laptops where each monitor is driven by a different GPU, moving Plex between them can refresh the scale, so you may not see the bug there.
 
 **Taskbar pins.** If you pin the launcher, the running Plex window shows up as a separate taskbar icon.
 

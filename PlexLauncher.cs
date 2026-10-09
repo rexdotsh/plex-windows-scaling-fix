@@ -1,8 +1,10 @@
-// Plex for Windows locks its UI scale to whichever monitor it opens on. Opening
-// on a 100% monitor and moving to a 200% monitor leaves the UI drawn into a
-// quarter of the window; going the other way is fine. So before launching,
-// point Plex's saved screen (plex.ini [ui] screen=) at the highest-scaled
-// monitor that is currently connected.
+// Plex for Windows fixes its UI scale at startup, from the monitor under the
+// mouse pointer: Qt creates Plex's windows there before Plex moves them into
+// place, and the embedded browser never re-reads the scale. Started from a 100%
+// monitor, the UI is then drawn into a quarter of the window on a 200% monitor;
+// started at 200%, it looks right everywhere. So if the pointer isn't on the
+// highest-scaled monitor, park it there until Plex has created its UI window,
+// then put it back.
 
 using System;
 using System.Collections.Generic;
@@ -11,6 +13,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Text;
+using System.Threading;
 using Microsoft.Win32;
 
 static class PlexLauncher
@@ -19,12 +22,15 @@ static class PlexLauncher
     const string Title = "Plex Scaling Fix";
     const string Usage =
         "PlexLauncher.exe [options]\n\n" +
-        "Without options, opens Plex on the highest-scaled monitor.\n\n" +
+        "Without options, opens Plex so its UI scales correctly on every monitor.\n\n" +
         "--install\tAdd \"Plex (Scaling Fix)\" to the Start menu\n" +
         "--uninstall\tRemove it\n" +
-        "--plex <path>\tUse this Plex.exe\n" +
-        "--ini <path>\tEdit this plex.ini instead of Plex's own\n" +
-        "--no-launch\tOnly update plex.ini, don't start Plex";
+        "--plex <path>\tUse this Plex.exe";
+
+    // Plex creates two Qt windows at startup: the player cover, then the main
+    // window holding the web UI. The UI's scale is fixed once the second exists.
+    const int QtWindowsToWaitFor = 2;
+    const int MaxPointerHoldMs = 10000;
 
     static readonly string ExePath = typeof(PlexLauncher).Assembly.Location;
     static readonly string LogPath = Path.Combine(Path.GetDirectoryName(ExePath), "PlexLauncher.log");
@@ -36,27 +42,27 @@ static class PlexLauncher
         public string Name;
         public uint Dpi;
         public bool Primary;
-        public long Area;
+        public RECT Bounds;
+
+        public long Area { get { return (long)(Bounds.Right - Bounds.Left) * (Bounds.Bottom - Bounds.Top); } }
+
+        public bool Contains(POINT p)
+        {
+            return p.X >= Bounds.Left && p.X < Bounds.Right && p.Y >= Bounds.Top && p.Y < Bounds.Bottom;
+        }
     }
 
     [STAThread]
     static void Main(string[] args)
     {
-        string iniPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Plex\plex.ini");
         string plexOverride = null;
         string command = null;
-        bool launch = true;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--install" || args[i] == "--uninstall")
                 command = args[i];
             else if (args[i] == "--plex" && i + 1 < args.Length)
                 plexOverride = args[++i];
-            else if (args[i] == "--ini" && i + 1 < args.Length)
-                iniPath = args[++i];
-            else if (args[i] == "--no-launch")
-                launch = false;
             else
             {
                 MessageBoxW(IntPtr.Zero, "Unknown option: " + args[i] + "\n\n" + Usage, Title, MB_ICONERROR);
@@ -77,33 +83,61 @@ static class PlexLauncher
             return;
         }
 
+        // Work in physical pixels so pointer and monitor coordinates line up.
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
         var log = new List<string>();
         log.Add(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
         try
         {
-            if (launch && ActivateRunningPlex(log))
+            if (ActivateRunningPlex(log))
                 return;
 
+            Monitor target = null;
             try
             {
-                Monitor target = PickTargetMonitor(log);
-                if (target != null)
-                    SetSavedScreen(iniPath, target.Name, log);
+                target = PickTargetMonitor(log);
             }
             catch (Exception e)
             {
                 // Never let the workaround stop Plex from opening.
-                log.Add("Could not update plex.ini: " + e.Message);
+                log.Add("Could not read monitors: " + e.Message);
             }
 
-            if (launch)
+            POINT original;
+            GetCursorPos(out original);
+            bool park = target != null && !target.Contains(original);
+            POINT parked = new POINT();
+            if (park)
+            {
+                parked.X = (target.Bounds.Left + target.Bounds.Right) / 2;
+                parked.Y = (target.Bounds.Top + target.Bounds.Bottom) / 2;
+                SetCursorPos(parked.X, parked.Y);
+                log.Add(string.Format("Moved the pointer from ({0},{1}) to ({2},{3})", original.X, original.Y, parked.X, parked.Y));
+            }
+            else if (target != null)
+            {
+                log.Add("Pointer is already on " + target.Name);
+            }
+
+            Process plex;
+            try
             {
                 var start = new ProcessStartInfo(plexExe);
                 start.UseShellExecute = true;
                 start.WorkingDirectory = Path.GetDirectoryName(plexExe);
-                Process.Start(start);
+                plex = Process.Start(start);
                 log.Add("Started " + plexExe);
             }
+            catch
+            {
+                if (park)
+                    SetCursorPos(original.X, original.Y);
+                throw;
+            }
+
+            if (park)
+                WaitThenRestorePointer(plex, parked, original, log);
         }
         catch (Exception e)
         {
@@ -115,6 +149,71 @@ static class PlexLauncher
             try { File.WriteAllLines(LogPath, log.ToArray()); }
             catch (Exception) { }
         }
+    }
+
+    static void WaitThenRestorePointer(Process plex, POINT parked, POINT original, List<string> log)
+    {
+        var timer = Stopwatch.StartNew();
+        while (true)
+        {
+            POINT now;
+            GetCursorPos(out now);
+            if (Math.Abs(now.X - parked.X) > 2 || Math.Abs(now.Y - parked.Y) > 2)
+            {
+                log.Add("Pointer was moved after " + timer.ElapsedMilliseconds + " ms, leaving it alone");
+                return;
+            }
+            if (plex == null || plex.HasExited)
+            {
+                log.Add("Plex exited after " + timer.ElapsedMilliseconds + " ms");
+                break;
+            }
+            int qtWindows = CountQtWindows(plex.Id);
+            if (qtWindows >= QtWindowsToWaitFor)
+            {
+                log.Add("Plex created its UI window after " + timer.ElapsedMilliseconds + " ms");
+                break;
+            }
+            if (timer.ElapsedMilliseconds > MaxPointerHoldMs)
+            {
+                log.Add("Gave up waiting for Plex's UI window after " + timer.ElapsedMilliseconds + " ms (" + qtWindows + " Qt windows)");
+                break;
+            }
+            Thread.Sleep(10);
+        }
+        SetCursorPos(original.X, original.Y);
+        log.Add(string.Format("Moved the pointer back to ({0},{1})", original.X, original.Y));
+    }
+
+    static int CountQtWindows(int pid)
+    {
+        int count = 0;
+        EnumWindowsProc visit = null;
+        visit = delegate (IntPtr hwnd, IntPtr data)
+        {
+            uint owner;
+            GetWindowThreadProcessId(hwnd, out owner);
+            if (owner != pid)
+                return true;
+            var cls = new StringBuilder(64);
+            GetClassNameW(hwnd, cls, cls.Capacity);
+            string name = cls.ToString();
+            // Qt window classes look like "Qt5153QWindowOwnDCIcon".
+            if (name.StartsWith("Qt") && name.Contains("QWindow"))
+                count++;
+            return true;
+        };
+        EnumWindows(delegate (IntPtr hwnd, IntPtr data)
+        {
+            visit(hwnd, data);
+            uint owner;
+            GetWindowThreadProcessId(hwnd, out owner);
+            // Plex embeds its Qt windows in its own top-level window.
+            if (owner == pid)
+                EnumChildWindows(hwnd, visit, IntPtr.Zero);
+            return true;
+        }, IntPtr.Zero);
+        return count;
     }
 
     static string FindPlexExe()
@@ -155,7 +254,7 @@ static class PlexLauncher
             var link = (IShellLinkW)new ShellLink();
             link.SetPath(ExePath);
             link.SetWorkingDirectory(Path.GetDirectoryName(ExePath));
-            link.SetDescription("Open Plex on the highest-scaled monitor so its UI scales correctly");
+            link.SetDescription("Open Plex so its UI scales correctly on every monitor");
             link.SetIconLocation(File.Exists(plexExe) ? plexExe : ExePath, 0);
             ((IPersistFile)link).Save(ShortcutPath, false);
             MessageBoxW(IntPtr.Zero,
@@ -203,32 +302,25 @@ static class PlexLauncher
     static Monitor PickTargetMonitor(List<string> log)
     {
         var monitors = new List<Monitor>();
-        IntPtr previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        try
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate (IntPtr hMonitor, IntPtr hdc, ref RECT rect, IntPtr data)
         {
-            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate (IntPtr hMonitor, IntPtr hdc, ref RECT rect, IntPtr data)
+            var info = new MONITORINFOEX();
+            info.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+            uint dpiX, dpiY;
+            if (GetMonitorInfo(hMonitor, ref info) && GetDpiForMonitor(hMonitor, MDT_EFFECTIVE_DPI, out dpiX, out dpiY) == 0)
             {
-                var info = new MONITORINFOEX();
-                info.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
-                uint dpiX, dpiY;
-                if (GetMonitorInfo(hMonitor, ref info) && GetDpiForMonitor(hMonitor, MDT_EFFECTIVE_DPI, out dpiX, out dpiY) == 0)
-                {
-                    var m = new Monitor();
-                    m.Name = info.szDevice;
-                    m.Dpi = dpiX;
-                    m.Primary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
-                    m.Area = (long)(info.rcMonitor.Right - info.rcMonitor.Left) * (info.rcMonitor.Bottom - info.rcMonitor.Top);
-                    monitors.Add(m);
-                    log.Add(string.Format("Monitor {0}: {1}% scale, {2} px{3}",
-                        m.Name, m.Dpi * 100 / 96, m.Area, m.Primary ? ", primary" : ""));
-                }
-                return true;
-            }, IntPtr.Zero);
-        }
-        finally
-        {
-            SetThreadDpiAwarenessContext(previous);
-        }
+                var m = new Monitor();
+                m.Name = info.szDevice;
+                m.Dpi = dpiX;
+                m.Primary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+                m.Bounds = info.rcMonitor;
+                monitors.Add(m);
+                log.Add(string.Format("Monitor {0}: {1}% scale, ({2},{3})-({4},{5}){6}",
+                    m.Name, m.Dpi * 100 / 96, m.Bounds.Left, m.Bounds.Top, m.Bounds.Right, m.Bounds.Bottom,
+                    m.Primary ? ", primary" : ""));
+            }
+            return true;
+        }, IntPtr.Zero);
 
         if (monitors.Count == 0)
             return null;
@@ -243,62 +335,6 @@ static class PlexLauncher
         return monitors[0];
     }
 
-    static void SetSavedScreen(string iniPath, string screenName, List<string> log)
-    {
-        if (!File.Exists(iniPath))
-        {
-            log.Add(iniPath + " does not exist yet, leaving it alone.");
-            return;
-        }
-
-        string text = File.ReadAllText(iniPath);
-        // Split on \n and keep any \r on each line so existing line endings survive untouched.
-        string cr = text.Contains("\r\n") ? "\r" : "";
-        // QSettings escapes backslashes: \\.\DISPLAY1 is stored as \\\\.\\DISPLAY1
-        string entry = "screen=" + screenName.Replace(@"\", @"\\");
-        var lines = new List<string>(text.Split('\n'));
-
-        int section = lines.FindIndex(l => l.TrimEnd('\r').Trim() == "[ui]");
-        if (section < 0)
-        {
-            if (lines[lines.Count - 1] != "")
-            {
-                lines[lines.Count - 1] += cr;
-                lines.Add("");
-            }
-            lines.Insert(lines.Count - 1, cr);
-            lines.Insert(lines.Count - 1, "[ui]" + cr);
-            lines.Insert(lines.Count - 1, entry + cr);
-        }
-        else
-        {
-            int end = lines.FindIndex(section + 1, l => l.StartsWith("["));
-            if (end < 0)
-                end = lines.Count;
-            int existing = lines.FindIndex(section + 1, end - section - 1, l => l.StartsWith("screen="));
-            if (existing >= 0)
-            {
-                string current = lines[existing].TrimEnd('\r');
-                if (current == entry)
-                {
-                    log.Add("plex.ini already points at " + screenName);
-                    return;
-                }
-                log.Add("Replacing " + current);
-                lines[existing] = entry + (lines[existing].EndsWith("\r") ? "\r" : "");
-            }
-            else
-            {
-                lines.Insert(section + 1, entry + cr);
-            }
-        }
-
-        string tmp = iniPath + ".launcher-tmp";
-        File.WriteAllText(tmp, string.Join("\n", lines.ToArray()), new UTF8Encoding(false));
-        File.Replace(tmp, iniPath, iniPath + ".launcher-bak");
-        log.Add("Wrote " + entry + " to " + iniPath);
-    }
-
     const int SW_RESTORE = 9;
     const int MDT_EFFECTIVE_DPI = 0;
     const uint MONITORINFOF_PRIMARY = 1;
@@ -308,6 +344,9 @@ static class PlexLauncher
 
     [StructLayout(LayoutKind.Sequential)]
     struct RECT { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct POINT { public int X, Y; }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct MONITORINFOEX
@@ -321,6 +360,7 @@ static class PlexLauncher
     }
 
     delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdc, ref RECT rect, IntPtr data);
+    delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr data);
 
     [DllImport("user32.dll")]
     static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnumProc callback, IntPtr data);
@@ -333,6 +373,24 @@ static class PlexLauncher
 
     [DllImport("user32.dll")]
     static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+
+    [DllImport("user32.dll")]
+    static extern bool GetCursorPos(out POINT point);
+
+    [DllImport("user32.dll")]
+    static extern bool SetCursorPos(int x, int y);
+
+    [DllImport("user32.dll")]
+    static extern bool EnumWindows(EnumWindowsProc callback, IntPtr data);
+
+    [DllImport("user32.dll")]
+    static extern bool EnumChildWindows(IntPtr parent, EnumWindowsProc callback, IntPtr data);
+
+    [DllImport("user32.dll")]
+    static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetClassNameW(IntPtr hwnd, StringBuilder name, int size);
 
     [DllImport("user32.dll")]
     static extern bool IsIconic(IntPtr hwnd);
